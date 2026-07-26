@@ -1526,10 +1526,11 @@ func openAIToAnthropicRequest(body []byte) []byte {
 	if stream, _ := req["stream"].(bool); stream {
 		anthropicReq["stream"] = true
 	}
-	if temp, _ := req["temperature"].(float64); temp != 0 {
+	// 同 openAIToResponsesRequest：按 key 存在性判断，保留显式传入的 0
+	if temp, ok := req["temperature"].(float64); ok {
 		anthropicReq["temperature"] = temp
 	}
-	if topP, _ := req["top_p"].(float64); topP != 0 {
+	if topP, ok := req["top_p"].(float64); ok {
 		anthropicReq["top_p"] = topP
 	}
 	if mt, _ := req["max_tokens"].(float64); mt > 0 {
@@ -1633,6 +1634,51 @@ func convertOpenAIToolsToAnthropic(tools []any) []map[string]any {
 }
 
 // openAIToResponsesRequest 将 OpenAI Chat 请求转为 OpenAI Responses API 格式
+// chatContentToResponsesInput 把 Chat 的 content 转为 Responses 的 content。
+// 纯文本返回 string（与历史行为一致）；含图片时返回 Responses parts 数组，
+// 避免多模态内容在转发到 Responses 上游时被丢弃。
+func chatContentToResponsesInput(content any) any {
+	parts, ok := content.([]any)
+	if !ok {
+		if s, ok := content.(string); ok {
+			return s
+		}
+		return extractTextFromContentParts(content)
+	}
+	var converted []any
+	var textParts []string
+	hasImage := false
+	for _, p := range parts {
+		part, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch part["type"] {
+		case "input_text", "output_text", "summary_text", "text":
+			if t, ok := part["text"].(string); ok && t != "" {
+				textParts = append(textParts, t)
+				converted = append(converted, map[string]any{"type": "input_text", "text": t})
+			}
+		case "image_url", "input_image":
+			imageURL := responsesImageURLFromPart(part)
+			if imageURL == nil {
+				continue
+			}
+			hasImage = true
+			// Responses 协议的 input_image.image_url 是字符串，不是对象
+			image := map[string]any{"type": "input_image", "image_url": imageURL["url"]}
+			if detail, ok := imageURL["detail"].(string); ok && detail != "" {
+				image["detail"] = detail
+			}
+			converted = append(converted, image)
+		}
+	}
+	if hasImage {
+		return converted
+	}
+	return strings.Join(textParts, "\n")
+}
+
 func openAIToResponsesRequest(body []byte, upstream *UpstreamConfig) []byte {
 	var req map[string]any
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -1655,7 +1701,8 @@ func openAIToResponsesRequest(body []byte, upstream *UpstreamConfig) []byte {
 		content := msg["content"]
 
 		if role == "system" {
-			if s, ok := content.(string); ok {
+			// content 可能是 string，也可能是 multi-part 数组，两种都要拍平进 instructions
+			if s := extractTextFromContentParts(content); s != "" {
 				if instructions == "" {
 					instructions = s
 				} else {
@@ -1709,10 +1756,10 @@ func openAIToResponsesRequest(body []byte, upstream *UpstreamConfig) []byte {
 			continue
 		}
 
-		// user / 其他角色
+		// user / 其他角色（保留图片等非文本 part）
 		input = append(input, map[string]any{
 			"role":    role,
-			"content": extractTextFromContentParts(content),
+			"content": chatContentToResponsesInput(content),
 		})
 	}
 
@@ -1728,10 +1775,12 @@ func openAIToResponsesRequest(body []byte, upstream *UpstreamConfig) []byte {
 	if stream, _ := req["stream"].(bool); stream {
 		respReq["stream"] = true
 	}
-	if temp, _ := req["temperature"].(float64); temp != 0 {
+	// key 存在即代表调用方显式设置过（convertRequest 只在非 nil 时写入），
+	// 因此按 key 存在性判断，不能用零值判断，否则显式的 0 会被丢掉
+	if temp, ok := req["temperature"].(float64); ok {
 		respReq["temperature"] = temp
 	}
-	if topP, _ := req["top_p"].(float64); topP != 0 {
+	if topP, ok := req["top_p"].(float64); ok {
 		respReq["top_p"] = topP
 	}
 	if mt, _ := req["max_tokens"].(float64); mt > 0 {
@@ -1853,7 +1902,19 @@ func convertResponsesToChat(body []byte, modelID string) []byte {
 		"choices": []map[string]any{choice},
 	}
 	if usage, ok := resp["usage"]; ok {
-		chatResp["usage"] = usage
+		// Responses 用 input_tokens/output_tokens，Chat 客户端读 prompt_tokens/completion_tokens。
+		// 归一成 Chat 字段名，同时保留原始字段（含 *_tokens_details 等细节）供下游转换使用。
+		if um, ok := usage.(map[string]any); ok {
+			merged := responsesUsageToChatUsage(um)
+			for k, v := range um {
+				if _, exists := merged[k]; !exists {
+					merged[k] = v
+				}
+			}
+			chatResp["usage"] = merged
+		} else {
+			chatResp["usage"] = usage
+		}
 	}
 
 	result, _ := json.Marshal(chatResp)
@@ -3240,20 +3301,32 @@ func responsesStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser,
 		}
 	}
 
+	// arguments.delta 事件可能用 item_id 回指，也可能用 call_id，
+	// 因此两个 key 都登记到同一个索引，避免同一个工具调用被拆成两个索引
 	getToolIndex := func(item map[string]any) int {
-		id, _ := item["id"].(string)
-		if id == "" {
-			id, _ = item["call_id"].(string)
+		itemID, _ := item["id"].(string)
+		callID, _ := item["call_id"].(string)
+		if itemID != "" {
+			if idx, ok := toolIndexes[itemID]; ok {
+				return idx
+			}
 		}
-		if id == "" {
-			id = fmt.Sprintf("tool_%d", nextToolIndex)
-		}
-		if idx, ok := toolIndexes[id]; ok {
-			return idx
+		if callID != "" {
+			if idx, ok := toolIndexes[callID]; ok {
+				return idx
+			}
 		}
 		idx := nextToolIndex
-		toolIndexes[id] = idx
 		nextToolIndex++
+		if itemID != "" {
+			toolIndexes[itemID] = idx
+		}
+		if callID != "" {
+			toolIndexes[callID] = idx
+		}
+		if itemID == "" && callID == "" {
+			toolIndexes[fmt.Sprintf("tool_%d", idx)] = idx
+		}
 		return idx
 	}
 
@@ -4267,7 +4340,9 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 				// Avoid double-counting gateway stats for Responses -> Anthropic.
 				responsesStreamToChatHandler(chatW2, upResp, anthropicReq.Model, false)
 			}()
-			anthropicStreamHandler(w, io.NopCloser(pr2), anthropicReq.Model)
+			// 传 pr2 本体（不是 NopCloser）：anthropicStreamHandler 退出时关闭读端，
+			// 让阻塞在 pw2.Write 的 goroutine 立刻收到 ErrClosedPipe 退出
+			anthropicStreamHandler(w, pr2, anthropicReq.Model)
 		} else {
 			// OpenAI 上游：Chat SSE 流直接转为 Anthropic SSE 流
 			anthropicStreamHandler(w, upResp, anthropicReq.Model)
@@ -4318,6 +4393,8 @@ func anthropicMessagesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model string) {
+	// 必须关闭：作为 pipe 读端时，提前 return 会让写端 goroutine 永久阻塞
+	defer respBody.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -4327,10 +4404,15 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 	reader := bufio.NewReader(respBody)
 
 	msgID := fmt.Sprintf("msg_%s", randomString(24))
+	// blockIndex 是下一个可用的块序号；每个已开启的块都要记住自己拿到的真实序号，
+	// 不能用 blockIndex-1 反推——否则块交错时 delta/stop 会打到别的块上。
 	blockIndex := 0
 	thinkingBlockOpen := false
 	textBlockOpen := false
+	thinkingBlockIndex := -1
+	textBlockIndex := -1
 	toolCallAccumulator := map[int]map[string]string{}
+	toolBlockIndex := map[int]int{}
 	toolCallOrder := []int{}
 	messageStartSent := false
 	finishSeen := false
@@ -4366,7 +4448,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 		}
 		emitAnthropicEvent("content_block_stop", map[string]any{
 			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
+			"index":         thinkingBlockIndex,
 			"content_block": map[string]any{"type": "thinking"},
 		})
 		thinkingBlockOpen = false
@@ -4378,7 +4460,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 		}
 		emitAnthropicEvent("content_block_stop", map[string]any{
 			"type":          "content_block_stop",
-			"index":         blockIndex - 1,
+			"index":         textBlockIndex,
 			"content_block": map[string]any{"type": "text"},
 		})
 		textBlockOpen = false
@@ -4466,11 +4548,12 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 						},
 					})
 					thinkingBlockOpen = true
+					thinkingBlockIndex = blockIndex
 					blockIndex++
 				}
 				emitAnthropicEvent("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
-					"index": blockIndex - 1,
+					"index": thinkingBlockIndex,
 					"delta": map[string]any{
 						"type":     "thinking_delta",
 						"thinking": rcStr,
@@ -4493,11 +4576,12 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 						},
 					})
 					textBlockOpen = true
+					textBlockIndex = blockIndex
 					blockIndex++
 				}
 				emitAnthropicEvent("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
-					"index": blockIndex - 1,
+					"index": textBlockIndex,
 					"delta": map[string]any{
 						"type": "text_delta",
 						"text": contentStr,
@@ -4541,6 +4625,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 							"input": map[string]any{},
 						},
 					})
+					toolBlockIndex[upstreamIndex] = blockIndex
 					blockIndex++
 				}
 
@@ -4549,7 +4634,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 					toolCallAccumulator[upstreamIndex]["args"] += argDelta
 					emitAnthropicEvent("content_block_delta", map[string]any{
 						"type":  "content_block_delta",
-						"index": blockIndex - 1,
+						"index": toolBlockIndex[upstreamIndex],
 						"delta": map[string]any{
 							"type":         "input_json_delta",
 							"partial_json": argDelta,
@@ -4571,7 +4656,7 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 				acc := toolCallAccumulator[idx]
 				emitAnthropicEvent("content_block_stop", map[string]any{
 					"type":  "content_block_stop",
-					"index": blockIndex - len(toolCallOrder) + indexOfInt(toolCallOrder, idx),
+					"index": toolBlockIndex[idx],
 					"content_block": map[string]any{
 						"type":  "tool_use",
 						"id":    acc["id"],
@@ -4580,6 +4665,8 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 					},
 				})
 			}
+			// 已收尾的工具块不再重复 stop（上游异常多发 finish_reason 时会重复）
+			toolCallOrder = nil
 
 			switch finishReason {
 			case "length":
@@ -4633,15 +4720,6 @@ func anthropicStreamHandler(w http.ResponseWriter, respBody io.ReadCloser, model
 	emitAnthropicEvent("message_stop", map[string]any{"type": "message_stop"})
 }
 
-func indexOfInt(slice []int, val int) int {
-	for i, v := range slice {
-		if v == val {
-			return i
-		}
-	}
-	return 0
-}
-
 // ======================== Anthropic 流式转换 ========================
 
 // pipeResponseWriter 适配 io.Writer 到 http.ResponseWriter 接口
@@ -4669,6 +4747,8 @@ func (p *pipeResponseWriter) Flush() {
 
 // anthropicStreamToChatHandler 将上游 Anthropic SSE 流实时转为 OpenAI Chat SSE 格式并写入客户端
 func anthropicStreamToChatHandler(w http.ResponseWriter, respBody io.ReadCloser, model string) {
+	// 同 anthropicStreamHandler：作为 pipe 读端时必须关闭，否则写端 goroutine 泄漏
+	defer respBody.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -5692,6 +5772,8 @@ func responsesHandler(w http.ResponseWriter, r *http.Request) {
 // ======================== Responses Stream Handler ========================
 
 func responsesStreamHandler(w http.ResponseWriter, _ *http.Request, resp *http.Response, model string, tools []Tool, toolChoice any, toolNameMappings map[string]ResponseToolNameMapping) {
+	// 必须关闭：作为 pipe 读端时，提前 return 会让写端 goroutine 永久阻塞
+	defer resp.Body.Close()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
