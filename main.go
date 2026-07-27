@@ -393,7 +393,7 @@ func nextRetryDelay(delay time.Duration) time.Duration {
 
 func shouldRetryUpstreamStatus(status int) bool {
 	switch status {
-	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+	case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, http.StatusInternalServerError:
 		return true
 	default:
 		return false
